@@ -1,4 +1,4 @@
-# handler.py
+# handler.py - Versión SFT para acestep_v1.5_merge_sft_turbo_ta_0.5
 import runpod
 import json
 import requests
@@ -9,6 +9,14 @@ import base64
 import urllib.parse
 
 COMFYUI_URL = "http://127.0.0.1:8188"
+
+# Modelos requeridos para el workflow SFT
+REQUIRED_MODELS = {
+    "checkpoint": "acestep_v1.5_merge_sft_turbo_ta_0.5.safetensors",
+    "clip_1": "qwen_0.6b_ace15.safetensors",
+    "clip_2": "qwen_4b_ace15.safetensors",
+    "vae": "ace_1.5_vae.safetensors"
+}
 
 
 def log_system_info():
@@ -39,8 +47,9 @@ def log_system_info():
     print("\n--- Verificando /workspace (Pods) ---")
     if os.path.exists("/workspace"):
         print("/workspace EXISTE")
-        result = subprocess.run(["ls", "-la", "/workspace/models/checkpoints"], capture_output=True, text=True)
-        print(f"checkpoints: {result.stdout}")
+        if os.path.exists("/workspace/models/checkpoints"):
+            result = subprocess.run(["ls", "-la", "/workspace/models/checkpoints"], capture_output=True, text=True)
+            print(f"checkpoints: {result.stdout}")
 
     print("\n--- Verificando extra_model_paths.yaml ---")
     config_path = "/comfyui/extra_model_paths.yaml"
@@ -54,6 +63,44 @@ def log_system_info():
     print("=" * 60)
 
 
+def check_models():
+    """Verifica que todos los modelos SFT estén disponibles"""
+    base_paths = ["/runpod-volume/models", "/workspace/models", "/comfyui/models"]
+    
+    found_models = {}
+    missing_models = []
+    
+    # Buscar checkpoint
+    for base in base_paths:
+        ckpt_path = f"{base}/checkpoints/{REQUIRED_MODELS['checkpoint']}"
+        if os.path.exists(ckpt_path):
+            found_models['checkpoint'] = ckpt_path
+            break
+    else:
+        missing_models.append(f"checkpoints/{REQUIRED_MODELS['checkpoint']}")
+    
+    # Buscar CLIP models
+    for clip_key in ["clip_1", "clip_2"]:
+        for base in base_paths:
+            clip_path = f"{base}/clip/{REQUIRED_MODELS[clip_key]}"
+            if os.path.exists(clip_path):
+                found_models[clip_key] = clip_path
+                break
+        else:
+            missing_models.append(f"clip/{REQUIRED_MODELS[clip_key]}")
+    
+    # Buscar VAE
+    for base in base_paths:
+        vae_path = f"{base}/vae/{REQUIRED_MODELS['vae']}"
+        if os.path.exists(vae_path):
+            found_models['vae'] = vae_path
+            break
+    else:
+        missing_models.append(f"vae/{REQUIRED_MODELS['vae']}")
+    
+    return found_models, missing_models
+
+
 def wait_for_comfyui():
     max_retries = 30
     for i in range(max_retries):
@@ -61,6 +108,16 @@ def wait_for_comfyui():
             response = requests.get(f"{COMFYUI_URL}/system_stats", timeout=5)
             if response.status_code == 200:
                 print("ComfyUI listo")
+                
+                # Verificar modelos al inicio
+                found, missing = check_models()
+                if missing:
+                    print(f"WARNING: Modelos faltantes: {missing}")
+                else:
+                    print(f"Todos los modelos SFT encontrados:")
+                    for k, v in found.items():
+                        print(f"  - {k}: {v}")
+                
                 log_system_info()
                 return True
         except:
@@ -111,6 +168,34 @@ def download_audio_from_comfyui(audio_info):
         return None, f"Error descargando audio: {str(e)}"
 
 
+def find_save_audio_node(outputs):
+    """
+    Encuentra el nodo SaveAudioMP3 en los outputs.
+    Busca en múltiples nodos posibles (8, 9, o cualquier otro).
+    """
+    # Posibles nodos donde puede estar el SaveAudioMP3
+    possible_nodes = ["9", "8", "10", "11", "12"]
+    
+    for node_id in possible_nodes:
+        if node_id in outputs:
+            node_output = outputs[node_id]
+            if isinstance(node_output, dict) and "audio" in node_output:
+                audio_list = node_output["audio"]
+                if audio_list and len(audio_list) > 0:
+                    print(f"Audio encontrado en nodo {node_id}")
+                    return audio_list[0]
+    
+    # Si no encontramos en los nodos conocidos, buscar en todos
+    for node_id, node_output in outputs.items():
+        if isinstance(node_output, dict) and "audio" in node_output:
+            audio_list = node_output["audio"]
+            if audio_list and len(audio_list) > 0:
+                print(f"Audio encontrado en nodo {node_id} (búsqueda general)")
+                return audio_list[0]
+    
+    return None
+
+
 def handler(job):
     job_input = job.get("input", {})
 
@@ -118,27 +203,17 @@ def handler(job):
         return {"error": "Missing workflow"}
 
     workflow = job_input["workflow"]
-
-    # Verificar todas las posibles ubicaciones del modelo
-    possible_paths = [
-        "/runpod-volume/models/checkpoints/ace_step_1.5_turbo_aio.safetensors",
-        "/workspace/models/checkpoints/ace_step_1.5_turbo_aio.safetensors",
-        "/comfyui/models/checkpoints/ace_step_1.5_turbo_aio.safetensors",
-        "/runpod-volume/models/unet/ace_step_1.5_turbo_aio.safetensors",
-        "/workspace/models/unet/ace_step_1.5_turbo_aio.safetensors"
-    ]
-
-    model_found = False
-    for path in possible_paths:
-        if os.path.exists(path):
-            print(f"Modelo encontrado en: {path}")
-            model_found = True
-            break
-
-    if not model_found:
-        print("ERROR: Modelo no encontrado en ninguna ubicación estándar")
+    
+    # Verificar que todos los modelos SFT estén disponibles
+    found_models, missing_models = check_models()
+    
+    if missing_models:
+        error_msg = f"Modelos SFT no encontrados: {missing_models}"
+        print(f"ERROR: {error_msg}")
         log_system_info()
-        return {"error": "Modelo ace_step_1.5_turbo_aio.safetensors no encontrado"}
+        return {"error": error_msg}
+    
+    print(f"Modelos SFT verificados: {list(found_models.keys())}")
 
     try:
         # Enviar workflow a ComfyUI
@@ -190,45 +265,39 @@ def handler(job):
                     outputs = job_data.get("outputs", {})
                     print(f"Outputs recibidos de ComfyUI: {json.dumps(outputs, default=str)[:500]}")
 
-                    # Buscar audio en el nodo 8 (SaveAudioMP3)
-                    if "8" in outputs:
-                        node_output = outputs["8"]
+                    # Buscar audio en cualquier nodo SaveAudioMP3
+                    audio_info = find_save_audio_node(outputs)
+                    
+                    if audio_info:
+                        filename = audio_info.get("filename", "")
+                        print(f"Audio encontrado: {json.dumps(audio_info)}")
 
-                        if isinstance(node_output, dict) and "audio" in node_output:
-                            audio_list = node_output["audio"]
+                        # Descargar el archivo localmente
+                        audio_bytes, error = download_audio_from_comfyui(audio_info)
 
-                            if audio_list and len(audio_list) > 0:
-                                audio_info = audio_list[0]
-                                filename = audio_info.get("filename", "")
-                                print(f"Audio encontrado: {json.dumps(audio_info)}")
+                        if error:
+                            return {
+                                "error": f"Error descargando audio: {error}",
+                                "audio_info": audio_info
+                            }
 
-                                # === CLAVE: Descargar el archivo localmente ===
-                                audio_bytes, error = download_audio_from_comfyui(audio_info)
+                        # Codificar en base64 para enviar en la respuesta
+                        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                        print(f"Audio codificado en base64: {len(audio_b64)} caracteres")
 
-                                if error:
-                                    return {
-                                        "error": f"Error descargando audio: {error}",
-                                        "audio_info": audio_info
-                                    }
-
-                                # Codificar en base64 para enviar en la respuesta
-                                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                                print(f"Audio codificado en base64: {len(audio_b64)} caracteres")
-
-                                return {
-                                    "status": "success",
-                                    "audio_base64": audio_b64,
-                                    "filename": filename,
-                                    "content_type": "audio/mpeg",
-                                    "file_size": len(audio_bytes),
-                                    "prompt_id": prompt_id
-                                }
+                        return {
+                            "status": "success",
+                            "audio_base64": audio_b64,
+                            "filename": filename,
+                            "content_type": "audio/mpeg",
+                            "file_size": len(audio_bytes),
+                            "prompt_id": prompt_id
+                        }
 
                     # Si llegamos aquí, no encontramos audio
-                    # Verificar si hay otros nodos con output
                     if outputs:
                         return {
-                            "error": "No se encontró audio en el nodo 8",
+                            "error": "No se encontró audio en ningún nodo SaveAudioMP3",
                             "available_outputs": list(outputs.keys()),
                             "outputs_preview": {k: str(v)[:200] for k, v in outputs.items()}
                         }
@@ -241,7 +310,7 @@ def handler(job):
         return {"error": str(e)}
 
 
-print("Iniciando worker ACE-STEP...")
+print("Iniciando worker ACE-STEP SFT...")
 if not wait_for_comfyui():
     print("WARNING: ComfyUI no respondió a tiempo")
 
