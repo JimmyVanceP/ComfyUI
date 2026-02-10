@@ -5,10 +5,81 @@ import requests
 import time
 import os
 import base64
+import subprocess
 from pathlib import Path
 
 # URL de ComfyUI local
 COMFYUI_URL = "http://127.0.0.1:8188"
+
+def log_system_info():
+    """Loggear información completa del sistema de archivos"""
+    print("=" * 60)
+    print("DEBUG: Información del sistema de archivos")
+    print("=" * 60)
+    
+    # Verificar directorio de trabajo
+    print(f"Directorio actual: {os.getcwd()}")
+    
+    # Verificar si existe /workspace
+    print("\n--- Verificando /workspace ---")
+    if os.path.exists("/workspace"):
+        print("/workspace EXISTE")
+        result = subprocess.run(["ls", "-la", "/workspace"], capture_output=True, text=True)
+        print(result.stdout)
+        
+        if os.path.exists("/workspace/models"):
+            print("\nContenido de /workspace/models:")
+            result = subprocess.run(["ls", "-la", "/workspace/models"], capture_output=True, text=True)
+            print(result.stdout)
+            
+            # Verificar subcarpetas
+            for subdir in ["checkpoints", "unet", "vae", "clip"]:
+                path = f"/workspace/models/{subdir}"
+                if os.path.exists(path):
+                    print(f"\nContenido de {path}:")
+                    result = subprocess.run(["ls", "-la", path], capture_output=True, text=True)
+                    print(result.stdout)
+                else:
+                    print(f"\n{path}: NO EXISTE")
+    else:
+        print("/workspace NO EXISTE")
+    
+    # Verificar /comfyui/models
+    print("\n--- Verificando /comfyui/models ---")
+    if os.path.exists("/comfyui/models"):
+        print("/comfyui/models EXISTE")
+        result = subprocess.run(["ls", "-la", "/comfyui/models"], capture_output=True, text=True)
+        print(result.stdout)
+        
+        # Verificar subcarpetas
+        for subdir in ["checkpoints", "unet", "vae", "clip"]:
+            path = f"/comfyui/models/{subdir}"
+            if os.path.exists(path):
+                print(f"\nContenido de {path}:")
+                result = subprocess.run(["ls", "-la", path], capture_output=True, text=True)
+                print(result.stdout)
+            else:
+                print(f"\n{path}: NO EXISTE")
+    else:
+        print("/comfyui/models NO EXISTE")
+    
+    # Verificar archivo de configuración
+    print("\n--- Verificando configuración de ComfyUI ---")
+    if os.path.exists("/comfyui/extra_model_paths.yaml"):
+        print("extra_model_paths.yaml EXISTE")
+        with open("/comfyui/extra_model_paths.yaml", "r") as f:
+            print(f.read())
+    else:
+        print("extra_model_paths.yaml NO EXISTE")
+    
+    # Verificar variables de entorno
+    print("\n--- Variables de entorno relevantes ---")
+    print(f"HOME: {os.environ.get('HOME', 'NO SET')}")
+    print(f"PWD: {os.environ.get('PWD', 'NO SET')}")
+    
+    print("=" * 60)
+    print("FIN DEBUG")
+    print("=" * 60)
 
 def wait_for_comfyui():
     """Espera a que ComfyUI esté listo"""
@@ -18,9 +89,11 @@ def wait_for_comfyui():
             response = requests.get(f"{COMFYUI_URL}/system_stats", timeout=5)
             if response.status_code == 200:
                 print("ComfyUI está listo")
+                # Loggear info del sistema
+                log_system_info()
                 return True
-        except:
-            print(f"Esperando a ComfyUI... intento {i+1}/{max_retries}")
+        except Exception as e:
+            print(f"Esperando a ComfyUI... intento {i+1}/{max_retries} - Error: {str(e)}")
             time.sleep(2)
     return False
 
@@ -36,6 +109,26 @@ def handler(job):
         return {"error": "Missing 'workflow' in input"}
     
     workflow = job_input["workflow"]
+    
+    # Loggear estado actual de archivos antes de procesar
+    print("\n--- Estado de archivos al recibir job ---")
+    log_system_info()
+    
+    # Verificar específicamente si el modelo existe
+    model_path_workspace = "/workspace/models/checkpoints/ace_step_1.5_turbo_aio.safetensors"
+    model_path_comfyui = "/comfyui/models/checkpoints/ace_step_1.5_turbo_aio.safetensors"
+    
+    if os.path.exists(model_path_workspace):
+        print(f"Modelo encontrado en: {model_path_workspace}")
+    elif os.path.exists(model_path_comfyui):
+        print(f"Modelo encontrado en: {model_path_comfyui}")
+    else:
+        print(f"Modelo NO encontrado en ninguna ubicación estándar")
+        # Buscar el archivo en todo el sistema
+        print("Buscando modelo en todo el sistema...")
+        result = subprocess.run(["find", "/", "-name", "ace_step_1.5_turbo_aio.safetensors", "2>/dev/null"], capture_output=True, text=True)
+        if result.stdout:
+            print(f"Modelo encontrado en: {result.stdout.strip()}")
     
     try:
         # Enviar el workflow a ComfyUI
@@ -86,7 +179,8 @@ def handler(job):
                     if job_data.get("status", {}).get("status_str") == "error":
                         return {
                             "error": "ComfyUI workflow error",
-                            "details": job_data.get("status", {})
+                            "details": job_data.get("status", {}),
+                            "system_info": "Revisa los logs anteriores para ver ubicación de modelos"
                         }
                     
                     # Extraer outputs
@@ -158,6 +252,8 @@ def extract_audio_from_outputs(outputs):
 print("Iniciando ComfyUI...")
 if not wait_for_comfyui():
     print("WARNING: ComfyUI no respondió en el tiempo esperado")
+    # Intentar loggear de todos modos
+    log_system_info()
 
 # Iniciar el serverless
 runpod.serverless.start({"handler": handler})
