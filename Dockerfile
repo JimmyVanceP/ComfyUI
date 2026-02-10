@@ -24,14 +24,32 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Instalar RunPod SDK
 RUN pip install --no-cache-dir runpod
 
+# ============================================
+# CONFIGURACIÓN PARA NETWORK VOLUME (Solución 1)
+# ============================================
+# Crear el archivo de configuración para que ComfyUI busque modelos en /workspace
+# en lugar de en /comfyui/models/
+RUN echo -e "comfyui:\n  base_path: /workspace\n  checkpoints: models/checkpoints/\n  clip: models/clip/\n  clip_vision: models/clip_vision/\n  configs: models/configs/\n  controlnet: models/controlnet/\n  diffusion_models: models/diffusion_models/\n  embeddings: models/embeddings/\n  loras: models/loras/\n  upscale_models: models/upscale_models/\n  vae: models/vae/\n  unet: models/unet/\n  gligen: models/gligen/\n  hypernetworks: models/hypernetworks/\n  style_models: models/style_models/\n  t2i_adapter: models/t2i_adapter/" > /comfyui/extra_model_paths.yaml
+
+# Crear los directorios en /workspace por si acaso (aunque el Network Volume debería crearlos)
+RUN mkdir -p /workspace/models/{checkpoints,clip,clip_vision,configs,controlnet,diffusion_models,embeddings,loras,upscale_models,vae,unet,gligen,hypernetworks,style_models,t2i_adapter}
+
 # Copiar el handler
 COPY handler.py /handler.py
 
-# Crear directorio para outputs
-RUN mkdir -p /comfyui/output
+# Crear directorio para outputs (también en /workspace para persistencia)
+RUN mkdir -p /workspace/output
 
 # Crear script de inicio (CORREGIDO)
 RUN printf '#!/bin/bash\n\
+echo "Verificando montaje de Network Volume..."\n\
+if [ -d "/workspace/models" ]; then\n\
+    echo "Network Volume detectado en /workspace/models"\n\
+    echo "Contenido de checkpoints:"\n\
+    ls -la /workspace/models/checkpoints/ 2>/dev/null || echo "Carpeta checkpoints vacía o no accesible"\n\
+else\n\
+    echo "ADVERTENCIA: No se detectó Network Volume en /workspace/models"\n\
+fi\n\
 echo "Iniciando ComfyUI v0.12.3..."\n\
 cd /comfyui && python main.py --listen 0.0.0.0 --port 8188 --preview-method auto &\n\
 echo "Esperando a que ComfyUI esté listo..."\n\
