@@ -1,0 +1,78 @@
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# You can override these at build time to use your own fork:
+#   --build-arg COMFYUI_REPO=https://github.com/<you>/<your-comfyui-fork>.git
+#   --build-arg COMFYUI_REF=main
+ARG COMFYUI_REPO=https://github.com/Comfy-Org/ComfyUI.git
+ARG COMFYUI_REF=master
+
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    curl \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /comfyui
+
+# Clone latest ComfyUI (or your fork/ref).
+RUN git clone "${COMFYUI_REPO}" . && \
+    git checkout "${COMFYUI_REF}"
+
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir runpod requests
+
+# Make ComfyUI load models from RunPod network volume.
+RUN echo "comfyui:" > /comfyui/extra_model_paths.yaml && \
+    echo "  base_path: /runpod-volume" >> /comfyui/extra_model_paths.yaml && \
+    echo "  checkpoints: models/checkpoints/" >> /comfyui/extra_model_paths.yaml && \
+    echo "  clip: models/clip/" >> /comfyui/extra_model_paths.yaml && \
+    echo "  vae: models/vae/" >> /comfyui/extra_model_paths.yaml && \
+    echo "  unet: models/unet/" >> /comfyui/extra_model_paths.yaml
+
+# Keep compatibility path used by some workflows/scripts.
+RUN mkdir -p /workspace && ln -s /comfyui/models /workspace/models 2>/dev/null || true
+
+# Handler entrypoint for RunPod serverless.
+COPY ["handler-z-image.py", "/handler.py"]
+
+RUN printf '#!/bin/bash\n\
+set -e\n\
+echo "========================================"\n\
+echo "STARTING RUNPOD IMAGE WORKER"\n\
+echo "========================================"\n\
+echo "COMFYUI_REPO: ${COMFYUI_REPO}"\n\
+echo "COMFYUI_REF: ${COMFYUI_REF}"\n\
+echo "--- Git revision ---"\n\
+cd /comfyui && git rev-parse --short HEAD\n\
+echo "--- RunPod volume check ---"\n\
+if [ -d "/runpod-volume/models" ]; then\n\
+  ls -la /runpod-volume/models || true\n\
+  ls -la /runpod-volume/models/unet || true\n\
+  ls -la /runpod-volume/models/clip || true\n\
+  ls -la /runpod-volume/models/vae || true\n\
+else\n\
+  echo "/runpod-volume/models missing"\n\
+fi\n\
+echo "--- extra_model_paths.yaml ---"\n\
+cat /comfyui/extra_model_paths.yaml\n\
+echo "Starting ComfyUI..."\n\
+cd /comfyui && python main.py --listen 0.0.0.0 --port 8188 --preview-method auto --disable-auto-launch &\n\
+echo "Waiting for ComfyUI health endpoint..."\n\
+for i in {1..90}; do\n\
+  if curl -fsS http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then\n\
+    echo "ComfyUI is ready."\n\
+    break\n\
+  fi\n\
+  sleep 2\n\
+done\n\
+echo "Starting RunPod handler..."\n\
+python /handler.py\n' > /start.sh && chmod +x /start.sh
+
+EXPOSE 8188
+CMD ["/bin/bash", "/start.sh"]
+
