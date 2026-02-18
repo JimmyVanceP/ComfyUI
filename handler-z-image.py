@@ -207,7 +207,6 @@ def handler(job):
                     }
 
                 image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-                image_data_uri = f"data:{content_type};base64,{image_b64}"
                 resolved_seed = job_input.get("seed")
 
                 return {
@@ -218,9 +217,6 @@ def handler(job):
                     "filename": image_info.get("filename"),
                     "content_type": content_type,
                     "file_size": len(image_bytes),
-                    "image": image_data_uri,
-                    "image_url": image_data_uri,
-                    "images": [image_data_uri],
                     "image_base64": image_b64,
                 }
 
