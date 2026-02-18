@@ -208,10 +208,6 @@ def compress_image_bytes(image_bytes, content_type):
             if not compressed:
                 return image_bytes, content_type, "Compression produced empty payload"
 
-            # Keep original only if compression unexpectedly increases size too much.
-            if len(compressed) > int(len(image_bytes) * 1.10):
-                return image_bytes, content_type, "Compressed image larger than original, using original"
-
             return compressed, new_content_type, None
     except Exception as exc:
         return image_bytes, content_type, f"Compression failed: {exc}"
