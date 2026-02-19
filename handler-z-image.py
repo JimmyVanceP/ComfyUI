@@ -2,7 +2,6 @@ import base64
 import io
 import json
 import os
-import re
 import subprocess
 import time
 import urllib.parse
@@ -22,19 +21,11 @@ def _read_int_env(key, default, min_value=0):
         return default
 
 
-# Expected model files for workflows used from the WordPress backend.
-EXPECTED_MODEL_GROUPS = {
-    "z_image_flataipro": [
-        "unet/z_image_turbo_bf16.safetensors",
-        "clip/qwen_3_4b.safetensors",
-        "vae/ae.safetensors",
-    ],
-    "flux2_klein9b_edit": [
-        "unet/flux-2-klein-9b.safetensors",
-        "clip/qwen_3_8b_fp8mixed.safetensors",
-        "vae/flux2-vae.safetensors",
-        "loras/klein_snofs_v1_1.safetensors",
-    ],
+# Expected z-image files used by the workflow shipped in WordPress backend.
+EXPECTED_MODELS = {
+    "unet": "z_image_turbo_bf16.safetensors",
+    "clip": "qwen_3_4b.safetensors",
+    "vae": "ae.safetensors",
 }
 
 # Output tuning to reduce transfer size from endpoint -> WordPress frontend.
@@ -48,10 +39,8 @@ except Exception:
     OUTPUT_IMAGE_QUALITY = 82
 
 COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "/comfyui/output").strip() or "/comfyui/output"
-COMFY_INPUT_DIR = os.environ.get("COMFY_INPUT_DIR", "/comfyui/input").strip() or "/comfyui/input"
 OUTPUT_CLEANUP_MAX_AGE_SECONDS = _read_int_env("OUTPUT_CLEANUP_MAX_AGE_SECONDS", 3600, 1)
 OUTPUT_CLEANUP_MIN_INTERVAL_SECONDS = _read_int_env("OUTPUT_CLEANUP_MIN_INTERVAL_SECONDS", 300, 1)
-INPUT_IMAGE_MAX_BYTES = _read_int_env("INPUT_IMAGE_MAX_BYTES", 15 * 1024 * 1024, 1024)
 
 LAST_OUTPUT_CLEANUP_TS = 0.0
 
@@ -68,49 +57,6 @@ def list_dir(path):
     return result.stdout.strip() or f"{path} (empty)"
 
 
-def cleanup_old_files_in_dir(base_dir, cutoff_ts):
-    stats = {
-        "scanned_files": 0,
-        "deleted_files": 0,
-        "deleted_dirs": 0,
-        "deleted_bytes": 0,
-        "errors": 0,
-    }
-
-    if not os.path.isdir(base_dir):
-        return stats
-
-    for root, _, files in os.walk(base_dir):
-        for filename in files:
-            file_path = os.path.join(root, filename)
-            try:
-                stats["scanned_files"] += 1
-                file_stat = os.stat(file_path)
-                if file_stat.st_mtime >= cutoff_ts:
-                    continue
-                stats["deleted_bytes"] += file_stat.st_size
-                os.remove(file_path)
-                stats["deleted_files"] += 1
-            except FileNotFoundError:
-                continue
-            except Exception as exc:
-                stats["errors"] += 1
-                print(f"[Cleanup] Failed deleting {file_path}: {exc}")
-
-    # Remove empty subfolders after file cleanup.
-    for root, _, _ in os.walk(base_dir, topdown=False):
-        if root == base_dir:
-            continue
-        try:
-            if not os.listdir(root):
-                os.rmdir(root)
-                stats["deleted_dirs"] += 1
-        except Exception:
-            continue
-
-    return stats
-
-
 def cleanup_old_comfy_outputs(force=False):
     global LAST_OUTPUT_CLEANUP_TS
 
@@ -123,49 +69,75 @@ def cleanup_old_comfy_outputs(force=False):
 
     LAST_OUTPUT_CLEANUP_TS = now
 
+    if not os.path.isdir(COMFY_OUTPUT_DIR):
+        print(f"[Cleanup] Output dir not found: {COMFY_OUTPUT_DIR}")
+        return
+
     cutoff_ts = now - OUTPUT_CLEANUP_MAX_AGE_SECONDS
-    output_stats = cleanup_old_files_in_dir(COMFY_OUTPUT_DIR, cutoff_ts)
-    input_stats = cleanup_old_files_in_dir(COMFY_INPUT_DIR, cutoff_ts)
+    scanned_files = 0
+    deleted_files = 0
+    deleted_dirs = 0
+    deleted_bytes = 0
+    errors = 0
+
+    for root, _, files in os.walk(COMFY_OUTPUT_DIR):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            try:
+                scanned_files += 1
+                file_stat = os.stat(file_path)
+                if file_stat.st_mtime >= cutoff_ts:
+                    continue
+                deleted_bytes += file_stat.st_size
+                os.remove(file_path)
+                deleted_files += 1
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                errors += 1
+                print(f"[Cleanup] Failed deleting {file_path}: {exc}")
+
+    # Remove empty subfolders after file cleanup.
+    for root, _, _ in os.walk(COMFY_OUTPUT_DIR, topdown=False):
+        if root == COMFY_OUTPUT_DIR:
+            continue
+        try:
+            if not os.listdir(root):
+                os.rmdir(root)
+                deleted_dirs += 1
+        except Exception:
+            continue
 
     print(
         "[Cleanup] Periodic output cleanup completed. "
-        f"output_dir={COMFY_OUTPUT_DIR}, "
-        f"input_dir={COMFY_INPUT_DIR}, "
+        f"dir={COMFY_OUTPUT_DIR}, "
         f"older_than_s={OUTPUT_CLEANUP_MAX_AGE_SECONDS}, "
-        f"scanned_files={output_stats['scanned_files'] + input_stats['scanned_files']}, "
-        f"deleted_files={output_stats['deleted_files'] + input_stats['deleted_files']}, "
-        f"deleted_dirs={output_stats['deleted_dirs'] + input_stats['deleted_dirs']}, "
-        f"freed_mb={(output_stats['deleted_bytes'] + input_stats['deleted_bytes']) / (1024 * 1024):.2f}, "
-        f"errors={output_stats['errors'] + input_stats['errors']}"
+        f"scanned_files={scanned_files}, "
+        f"deleted_files={deleted_files}, "
+        f"deleted_dirs={deleted_dirs}, "
+        f"freed_mb={deleted_bytes / (1024 * 1024):.2f}, "
+        f"errors={errors}"
     )
 
 
 def check_expected_models():
     base_paths = ["/runpod-volume/models", "/workspace/models", "/comfyui/models"]
-    found_by_group = {}
-    missing_by_group = {}
+    found = {}
+    missing = []
 
-    for group_name, relative_paths in EXPECTED_MODEL_GROUPS.items():
-        group_found = {}
-        group_missing = []
-        for relative_path in relative_paths:
-            located = None
-            for base in base_paths:
-                candidate = os.path.join(base, relative_path)
-                if os.path.exists(candidate):
-                    located = candidate
-                    break
-            if located:
-                group_found[relative_path] = located
-            else:
-                group_missing.append(relative_path)
+    for model_type, filename in EXPECTED_MODELS.items():
+        located = None
+        for base in base_paths:
+            candidate = f"{base}/{model_type}/{filename}"
+            if os.path.exists(candidate):
+                located = candidate
+                break
+        if located:
+            found[model_type] = located
+        else:
+            missing.append(f"{model_type}/{filename}")
 
-        if group_found:
-            found_by_group[group_name] = group_found
-        if group_missing:
-            missing_by_group[group_name] = group_missing
-
-    return found_by_group, missing_by_group
+    return found, missing
 
 
 def log_startup_diagnostics():
@@ -177,13 +149,9 @@ def log_startup_diagnostics():
     print(list_dir("/runpod-volume/models/unet"))
     print(list_dir("/runpod-volume/models/clip"))
     print(list_dir("/runpod-volume/models/vae"))
-    print(list_dir("/runpod-volume/models/loras"))
     print(list_dir("/comfyui/models/unet"))
     print(list_dir("/comfyui/models/clip"))
     print(list_dir("/comfyui/models/vae"))
-    print(list_dir("/comfyui/models/loras"))
-    print(list_dir(COMFY_INPUT_DIR))
-    print(list_dir(COMFY_OUTPUT_DIR))
     print(list_dir("/workspace/models"))
 
     extra_paths_file = "/comfyui/extra_model_paths.yaml"
@@ -324,151 +292,6 @@ def compress_image_bytes(image_bytes, content_type):
         return image_bytes, content_type, f"Compression failed: {exc}"
 
 
-def _sanitize_input_filename(filename, default_name):
-    if not isinstance(filename, str) or not filename.strip():
-        return default_name
-
-    safe_name = os.path.basename(filename.strip())
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", safe_name).lstrip(".")
-    if not safe_name:
-        return default_name
-    return safe_name[:180]
-
-
-def _decode_image_data_uri(data_uri):
-    if not isinstance(data_uri, str) or not data_uri.strip():
-        return None, None, "Missing image data URI"
-
-    match = re.match(
-        r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$",
-        data_uri.strip(),
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        return None, None, "Invalid data URI format"
-
-    content_type = match.group(1).lower()
-    encoded_payload = re.sub(r"\s+", "", match.group(2))
-    try:
-        image_bytes = base64.b64decode(encoded_payload, validate=True)
-    except Exception:
-        return None, None, "Invalid base64 image payload"
-
-    if not image_bytes or len(image_bytes) < 32:
-        return None, None, "Decoded image payload is too small"
-    if len(image_bytes) > INPUT_IMAGE_MAX_BYTES:
-        return None, None, f"Input image exceeds max size ({INPUT_IMAGE_MAX_BYTES} bytes)"
-
-    return image_bytes, content_type, None
-
-
-def _content_type_to_extension(content_type):
-    mapping = {
-        "image/jpeg": "jpg",
-        "image/jpg": "jpg",
-        "image/png": "png",
-        "image/webp": "webp",
-        "image/gif": "gif",
-        "image/bmp": "bmp",
-    }
-    return mapping.get(str(content_type).lower(), "png")
-
-
-def prepare_job_input_images(input_images):
-    if not input_images:
-        return [], None
-
-    if not isinstance(input_images, list):
-        return [], "job.input.input_images must be an array"
-
-    try:
-        os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
-    except Exception as exc:
-        return [], f"Failed to create ComfyUI input dir '{COMFY_INPUT_DIR}': {exc}"
-
-    prepared = []
-    for index, item in enumerate(input_images):
-        if not isinstance(item, dict):
-            return [], f"input_images[{index}] must be an object"
-
-        data_uri = (
-            item.get("data_uri")
-            or item.get("image_data_uri")
-            or item.get("imageDataUri")
-            or item.get("image")
-        )
-        image_bytes, content_type, decode_error = _decode_image_data_uri(data_uri)
-        if decode_error:
-            return [], f"input_images[{index}] {decode_error}"
-
-        extension = _content_type_to_extension(content_type)
-        default_name = f"job-input-{int(time.time())}-{index}.{extension}"
-        filename = _sanitize_input_filename(item.get("filename"), default_name)
-        if "." not in filename:
-            filename = f"{filename}.{extension}"
-
-        file_path = os.path.join(COMFY_INPUT_DIR, filename)
-        try:
-            with open(file_path, "wb") as file_handle:
-                file_handle.write(image_bytes)
-        except Exception as exc:
-            return [], f"Failed writing input image '{filename}': {exc}"
-
-        prepared_item = {
-            "filename": filename,
-            "path": file_path,
-            "bytes": len(image_bytes),
-            "content_type": content_type,
-            "node_id": item.get("node_id"),
-            "node_field": item.get("node_field", "image"),
-        }
-        prepared.append(prepared_item)
-        print(
-            "Prepared input image for workflow: "
-            f"filename={filename}, bytes={len(image_bytes)}, content_type={content_type}"
-        )
-
-    return prepared, None
-
-
-def inject_input_images_into_workflow(workflow, prepared_images):
-    if not isinstance(workflow, dict) or not prepared_images:
-        return
-
-    for prepared in prepared_images:
-        filename = prepared["filename"]
-        target_node_id = prepared.get("node_id")
-        target_field = str(prepared.get("node_field") or "image")
-
-        # Explicit node mapping takes priority.
-        if target_node_id is not None:
-            workflow_node = workflow.get(str(target_node_id))
-            if isinstance(workflow_node, dict):
-                node_inputs = workflow_node.setdefault("inputs", {})
-                if isinstance(node_inputs, dict):
-                    node_inputs[target_field] = filename
-                    print(
-                        "Mapped input image to workflow node: "
-                        f"node={target_node_id}, field={target_field}, file={filename}"
-                    )
-                    continue
-
-        # Fallback: first LoadImage node found in workflow.
-        for node_id, workflow_node in workflow.items():
-            if not isinstance(workflow_node, dict):
-                continue
-            if workflow_node.get("class_type") != "LoadImage":
-                continue
-            node_inputs = workflow_node.setdefault("inputs", {})
-            if isinstance(node_inputs, dict):
-                node_inputs["image"] = filename
-                print(
-                    "Mapped input image to first LoadImage node: "
-                    f"node={node_id}, file={filename}"
-                )
-                break
-
-
 def handler(job):
     try:
         cleanup_old_comfy_outputs()
@@ -478,29 +301,8 @@ def handler(job):
         if not workflow:
             return {"error": "Missing workflow in job.input"}
 
-        if isinstance(workflow, str):
-            try:
-                workflow = json.loads(workflow)
-            except Exception as exc:
-                return {"error": f"Workflow is not valid JSON: {exc}"}
-
-        if not isinstance(workflow, dict):
-            return {"error": "Workflow must be an object/map"}
-
-        prepared_images, prepare_error = prepare_job_input_images(job_input.get("input_images", []))
-        if prepare_error:
-            return {"error": prepare_error}
-        inject_input_images_into_workflow(workflow, prepared_images)
-
         preferred_nodes = job_input.get("output_node_ids", ["9"])
-        if not isinstance(preferred_nodes, list) or not preferred_nodes:
-            preferred_nodes = ["9"]
-        preferred_nodes = [str(node_id) for node_id in preferred_nodes]
-
-        try:
-            max_wait = max(30, int(job_input.get("max_wait", 300)))
-        except Exception:
-            max_wait = 300
+        max_wait = int(job_input.get("max_wait", 300))
 
         response = requests.post(
             f"{COMFYUI_URL}/prompt",
@@ -590,15 +392,15 @@ def handler(job):
         return {"error": str(exc)}
 
 
-print("Starting RunPod image worker (flataipro z-image + flux2 klein9b edit / ComfyUI)...")
+print("Starting RunPod image worker (flataipro / ComfyUI)...")
 if not wait_for_comfyui():
     print("WARNING: ComfyUI did not become ready before worker start.")
 
 found_models, missing_models = check_expected_models()
 if missing_models:
-    print(f"WARNING: missing expected models by workflow: {missing_models}")
-if found_models:
-    print(f"Located expected models by workflow: {found_models}")
+    print(f"WARNING: missing expected models: {missing_models}")
+else:
+    print(f"All expected models located: {found_models}")
 
 log_startup_diagnostics()
 cleanup_old_comfy_outputs(force=True)
