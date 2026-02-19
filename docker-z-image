@@ -24,13 +24,14 @@ RUN git clone "${COMFYUI_REPO}" . && \
     git checkout "${COMFYUI_REF}"
 
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir runpod requests
+    pip install --no-cache-dir runpod requests pillow
 
 # Make ComfyUI load models from RunPod network volume.
 RUN echo "comfyui:" > /comfyui/extra_model_paths.yaml && \
     echo "  base_path: /runpod-volume" >> /comfyui/extra_model_paths.yaml && \
     echo "  checkpoints: models/checkpoints/" >> /comfyui/extra_model_paths.yaml && \
     echo "  clip: models/clip/" >> /comfyui/extra_model_paths.yaml && \
+    echo "  loras: models/loras/" >> /comfyui/extra_model_paths.yaml && \
     echo "  vae: models/vae/" >> /comfyui/extra_model_paths.yaml && \
     echo "  unet: models/unet/" >> /comfyui/extra_model_paths.yaml
 
@@ -54,6 +55,7 @@ if [ -d "/runpod-volume/models" ]; then\n\
   ls -la /runpod-volume/models || true\n\
   ls -la /runpod-volume/models/unet || true\n\
   ls -la /runpod-volume/models/clip || true\n\
+  ls -la /runpod-volume/models/loras || true\n\
   ls -la /runpod-volume/models/vae || true\n\
 else\n\
   echo "/runpod-volume/models missing"\n\
